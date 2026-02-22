@@ -1,106 +1,131 @@
 # ================================
-# DIAGNOSTICO N2 - REDE
+# DIAGNOSTICO N2 - REDE (v2)
 # ================================
 
 Clear-Host
-Write-Host "========================================="
-Write-Host " DIAGNOSTICO N2 - ANALISE DE REDE "
-Write-Host "========================================="
 
-# -------- VARIAVEIS PADRAO --------
+# -------- CONFIGURACAO DE LOG --------
+$Hostname = $env:COMPUTERNAME
+# Pega automaticamente a pasta exata onde este script esta localizado
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile = "$ScriptDir\Log_Rede_${Hostname}_$TimeStamp.txt"
+
+function Write-Log {
+    param([string]$Texto)
+    Write-Host $Texto
+    $Texto | Out-File -FilePath $LogFile -Append -Encoding UTF8
+}
+
+Write-Log "========================================="
+Write-Log " DIAGNOSTICO N2 - ANALISE DE REDE "
+Write-Log " Data: $(Get-Date)"
+Write-Log "========================================="
+
+# -------- VARIAVEIS --------
 $ADServer = "172.23.100.1"
 $InternetIP = "8.8.8.8"
 $TestDomain = "google.com"
 $PortsToTest = @(53,443,389,445)
 
-# -------- FUNCAO 1 - ESTADO IP --------
+$TotalSteps = 7
+$CurrentStep = 0
+
+function Update-Progress($StepName) {
+    $script:CurrentStep++
+    $percent = [int](($script:CurrentStep / $script:TotalSteps) * 100)
+    Write-Progress -Activity "Diagnostico N2 em execucao..." `
+                   -Status "$StepName ($percent%)" `
+                   -PercentComplete $percent
+}
+
+# -------- 1 - ESTADO DA INTERFACE --------
 function Get-NetworkState {
-    Write-Host "`n[1] ESTADO DA INTERFACE"
+    Update-Progress "Analisando interface de rede"
 
     $ipconfig = Get-NetIPConfiguration | Where-Object {$_.IPv4Address -ne $null}
 
     foreach ($i in $ipconfig) {
-        Write-Host "Interface: $($i.InterfaceAlias)"
-        Write-Host "IP: $($i.IPv4Address.IPAddress)"
-        Write-Host "Gateway: $($i.IPv4DefaultGateway.NextHop)"
-        Write-Host "DNS: $($i.DNSServer.ServerAddresses -join ', ')"
+        Write-Log "`nInterface: $($i.InterfaceAlias)"
+        Write-Log "IP: $($i.IPv4Address.IPAddress)"
+        Write-Log "Gateway: $($i.IPv4DefaultGateway.NextHop)"
+        Write-Log "DNS: $($i.DNSServer.ServerAddresses -join ', ')"
 
         if ($i.IPv4Address.IPAddress -like "169.*") {
-            Write-Host "⚠ APIPA detectado - Problema DHCP ou VLAN"
+            Write-Log "[!] APIPA detectado"
         }
     }
 }
 
-# -------- FUNCAO 2 - TESTE PING --------
+# -------- 2 - TESTE PING --------
 function Test-Ping($Target) {
     $result = Test-Connection -ComputerName $Target -Count 4 -ErrorAction SilentlyContinue
-    if ($result) {
-        Write-Host "Ping OK -> $Target"
-        return $true
-    } else {
-        Write-Host "Falha Ping -> $Target"
-        return $false
-    }
+    return $result -ne $null
 }
 
-# -------- FUNCAO 3 - TESTE DNS --------
+# -------- 3 - TESTE DNS --------
 function Test-DNS {
-    Write-Host "`n[2] TESTE DNS"
+    Update-Progress "Testando resolucao DNS"
+
     try {
         Resolve-DnsName $TestDomain -ErrorAction Stop | Out-Null
-        Write-Host "DNS OK"
+        Write-Log "DNS OK"
         return $true
     }
     catch {
-        Write-Host "Falha DNS"
+        Write-Log "Falha DNS"
         return $false
     }
 }
 
-# -------- FUNCAO 4 - TESTE PORTAS --------
+# -------- 4 - TESTE PORTAS --------
 function Test-Ports {
-    Write-Host "`n[3] TESTE DE PORTAS"
+    Update-Progress "Testando portas criticas"
+
     foreach ($port in $PortsToTest) {
         $test = Test-NetConnection -ComputerName $InternetIP -Port $port -WarningAction SilentlyContinue
         if ($test.TcpTestSucceeded) {
-            Write-Host "Porta $port OK"
+            Write-Log "Porta $port OK"
         } else {
-            Write-Host "Porta $port BLOQUEADA"
+            Write-Log "Porta $port BLOQUEADA"
         }
     }
 }
 
-# -------- FUNCAO 5 - JITTER --------
+# -------- 5 - JITTER --------
 function Test-Jitter {
-    Write-Host "`n[4] TESTE JITTER"
+    Update-Progress "Calculando jitter"
 
     $pings = Test-Connection -ComputerName $InternetIP -Count 10
     $times = $pings.ResponseTime
 
-    $avg = ($times | Measure-Object -Average).Average
-    $max = ($times | Measure-Object -Maximum).Maximum
-    $min = ($times | Measure-Object -Minimum).Minimum
+    if ($times) {
+        $avg = ($times | Measure-Object -Average).Average
+        $max = ($times | Measure-Object -Maximum).Maximum
+        $min = ($times | Measure-Object -Minimum).Minimum
+        $jitter = $max - $min
 
-    $jitter = $max - $min
+        Write-Log "Latencia media: $avg ms"
+        Write-Log "Jitter: $jitter ms"
 
-    Write-Host "Latência Média: $avg ms"
-    Write-Host "Jitter: $jitter ms"
-
-    if ($jitter -gt 50) {
-        Write-Host "⚠ Jitter elevado - possível congestionamento"
+        if ($jitter -gt 50) {
+            Write-Log "[!] Jitter elevado"
+        }
+    } else {
+        Write-Log "Falha ao calcular Jitter. Sem resposta de ping."
     }
 }
 
-# -------- FUNCAO 6 - MTU --------
+# -------- 6 - MTU --------
 function Test-MTU {
-    Write-Host "`n[5] TESTE MTU"
+    Update-Progress "Detectando MTU"
 
     $size = 1472
     $success = $false
 
     while ($size -gt 1300 -and -not $success) {
         $ping = ping $InternetIP -f -l $size -n 1
-        if ($ping -notmatch "fragmentado") {
+        if ($ping -notmatch "fragmentado" -and $ping -match "TTL=") {
             $success = $true
         } else {
             $size -= 10
@@ -108,24 +133,26 @@ function Test-MTU {
     }
 
     $mtu = $size + 28
-    Write-Host "MTU detectado: $mtu"
+    Write-Log "MTU detectado: $mtu"
 }
 
-# -------- FUNCAO 7 - CLASSIFICACAO --------
+# -------- 7 - CLASSIFICACAO --------
 function Get-Classification($gw,$ad,$dns) {
-    Write-Host "`n[6] CLASSIFICACAO FINAL"
+    Update-Progress "Gerando classificacao final"
+
+    Write-Log "`n===== CLASSIFICACAO ====="
 
     if (-not $gw) {
-        Write-Host "Provável Camada 1/2 - Gateway inacessível"
+        Write-Log "Camada provavel: 1/2 (Gateway inacessivel)"
     }
     elseif (-not $ad) {
-        Write-Host "Provável VLAN/ACL interna"
+        Write-Log "Provavel bloqueio VLAN/ACL interna"
     }
     elseif (-not $dns) {
-        Write-Host "Problema provável DNS"
+        Write-Log "Falha provavel DNS"
     }
     else {
-        Write-Host "Infraestrutura saudável - verificar aplicação ou firewall específico"
+        Write-Log "Infraestrutura saudavel"
     }
 }
 
@@ -133,17 +160,26 @@ function Get-Classification($gw,$ad,$dns) {
 
 Get-NetworkState
 
-Write-Host "`n[TESTES DE CONECTIVIDADE]"
-$gwTest = Test-Ping ((Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop)
+Update-Progress "Testando conectividade estrutural"
+$gwNextHop = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue).NextHop
+if ($gwNextHop) {
+    $gwTest = Test-Ping $gwNextHop
+} else {
+    $gwTest = $false
+}
 $adTest = Test-Ping $ADServer
 $internetTest = Test-Ping $InternetIP
 
 $dnsTest = Test-DNS
-
 Test-Ports
 Test-Jitter
 Test-MTU
-
 Get-Classification $gwTest $adTest $dnsTest
 
-Write-Host "`nDiagnóstico concluído."
+Write-Progress -Activity "Diagnostico N2 em execucao..." -Completed
+
+Write-Log "`nDiagnostico concluido."
+Write-Log "Log salvo com sucesso em: $LogFile"
+
+Write-Host "`nPressione ENTER para sair..."
+Read-Host
