@@ -1,15 +1,19 @@
 # ================================
-# DIAGNOSTICO N2 - REDE (v2)
+# DIAGNOSTICO N2 - REDE (v5 - Fail-Safe)
 # ================================
 
 Clear-Host
 
 # -------- CONFIGURACAO DE LOG --------
 $Hostname = $env:COMPUTERNAME
-# Pega automaticamente a pasta exata onde este script esta localizado
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile = "$ScriptDir\Log_Rede_${Hostname}_$TimeStamp.txt"
+
+# Variaveis globais de estado
+$global:ApipaGeral = $false
+$global:WifiApipa = $false
+$global:EthernetAtiva = $false
 
 function Write-Log {
     param([string]$Texto)
@@ -43,7 +47,10 @@ function Update-Progress($StepName) {
 function Get-NetworkState {
     Update-Progress "Analisando interface de rede"
 
-    $ipconfig = Get-NetIPConfiguration | Where-Object {$_.IPv4Address -ne $null}
+    $ipconfig = Get-NetIPConfiguration | Where-Object {
+        $_.IPv4Address -ne $null -and 
+        $_.InterfaceAlias -notmatch "Bluetooth|Virtual|VMware|Hyper-V|Loopback"
+    }
 
     foreach ($i in $ipconfig) {
         Write-Log "`nInterface: $($i.InterfaceAlias)"
@@ -51,14 +58,25 @@ function Get-NetworkState {
         Write-Log "Gateway: $($i.IPv4DefaultGateway.NextHop)"
         Write-Log "DNS: $($i.DNSServer.ServerAddresses -join ', ')"
 
-        if ($i.IPv4Address.IPAddress -like "169.*") {
-            Write-Log "[!] APIPA detectado"
+        # Verifica qual placa pegou APIPA ou qual esta saudavel
+        if ($i.IPv4Address.IPAddress -like "169.254.*") {
+            Write-Log "[!] APIPA detectado em: $($i.InterfaceAlias)"
+            if ($i.InterfaceAlias -match "Wi-Fi|Wireless") {
+                $global:WifiApipa = $true
+            } else {
+                $global:ApipaGeral = $true
+            }
+        } else {
+            if ($i.InterfaceAlias -match "Ethernet|Conexao Local") {
+                $global:EthernetAtiva = $true
+            }
         }
     }
 }
 
 # -------- 2 - TESTE PING --------
 function Test-Ping($Target) {
+    if (-not $Target) { return $false }
     $result = Test-Connection -ComputerName $Target -Count 4 -ErrorAction SilentlyContinue
     return $result -ne $null
 }
@@ -96,7 +114,7 @@ function Test-Ports {
 function Test-Jitter {
     Update-Progress "Calculando jitter"
 
-    $pings = Test-Connection -ComputerName $InternetIP -Count 10
+    $pings = Test-Connection -ComputerName $InternetIP -Count 10 -ErrorAction SilentlyContinue
     $times = $pings.ResponseTime
 
     if ($times) {
@@ -105,14 +123,14 @@ function Test-Jitter {
         $min = ($times | Measure-Object -Minimum).Minimum
         $jitter = $max - $min
 
-        Write-Log "Latencia media: $avg ms"
+        Write-Log "Latencia media: $([math]::Round($avg,2)) ms"
         Write-Log "Jitter: $jitter ms"
 
         if ($jitter -gt 50) {
             Write-Log "[!] Jitter elevado"
         }
     } else {
-        Write-Log "Falha ao calcular Jitter. Sem resposta de ping."
+        Write-Log "Falha ao calcular Jitter. Sem resposta de ping externo."
     }
 }
 
@@ -136,24 +154,57 @@ function Test-MTU {
     Write-Log "MTU detectado: $mtu"
 }
 
-# -------- 7 - CLASSIFICACAO --------
-function Get-Classification($gw,$ad,$dns) {
-    Update-Progress "Gerando classificacao final"
+# -------- 7 - CLASSIFICACAO FINAL --------
+function Get-Classification($gw, $internet, $dns, $ad) {
+    Update-Progress "Gerando laudo final"
 
-    Write-Log "`n===== CLASSIFICACAO ====="
+    Write-Log "`n========================================="
+    Write-Log " STATUS FINAL DA MAQUINA"
+    Write-Log "========================================="
 
-    if (-not $gw) {
-        Write-Log "Camada provavel: 1/2 (Gateway inacessivel)"
+    # FAIL-SAFE: Cabeada, com internet, mas o Wi-Fi esta abandonado com APIPA
+    if ($global:EthernetAtiva -and ($internet -or $dns) -and $global:WifiApipa) {
+        Write-Log "[ESTADO]: ONLINE / CABEADO E TOTALMENTE FUNCIONAL"
+        Write-Log "[FAIL-SAFE ATIVADO]: O adaptador Wi-Fi gerou um IP fantasma (APIPA), porem a maquina esta navegando pela rede Ethernet. Falso positivo ignorado."
     }
-    elseif (-not $ad) {
-        Write-Log "Provavel bloqueio VLAN/ACL interna"
+    # Regra de Ouro geral: Internet ou DNS funcionando
+    elseif ($internet -or $dns) {
+        Write-Log "[ESTADO]: CONECTADO E OPERACIONAL"
+        Write-Log "[CAMADA]: L1 a L7 Operacionais"
+        Write-Log "[CAUSA]: O trafego de rede esta fluindo normalmente."
+        
+        if ($global:ApipaGeral) {
+            Write-Log "`n[ALERTA SECUNDARIO]: Outro adaptador da maquina falhou no DHCP, mas nao afetou a navegacao."
+        }
     }
-    elseif (-not $dns) {
-        Write-Log "Falha provavel DNS"
+    # Falha real e critica de cabo/switch
+    elseif ($global:ApipaGeral) {
+        Write-Log "[ESTADO]: OFFLINE / SEM REDE"
+        Write-Log "[CAMADA]: Camadas 1 e 2 (Fisica / Enlace)"
+        Write-Log "[CAUSA]: Falha de DHCP na interface principal. Verifique cabo, porta do switch ou VLAN."
+    }
+    # Sem gateway e sem internet
+    elseif (-not $gw) {
+        Write-Log "[ESTADO]: COMUNICACAO LOCAL FALHA"
+        Write-Log "[CAMADA]: Camadas 1, 2 ou 3 (Fisica / Enlace / Rede)"
+        Write-Log "[CAUSA]: Gateway local inacessivel e maquina sem internet."
+    }
+    # Com gateway, mas sem internet
+    elseif ($gw -and (-not $internet -or -not $dns)) {
+        Write-Log "[ESTADO]: SEM ACESSO EXTERNO OU RESOLUCAO"
+        Write-Log "[CAMADA]: Camada 3 (Roteamento) ou Camada 7 (Aplicacao)"
+        Write-Log "[CAUSA]: O pacote chega ao Switch/Gateway, mas roteamento externo ou DNS estao falhando."
     }
     else {
-        Write-Log "Infraestrutura saudavel"
+        Write-Log "[ESTADO]: INDETERMINADO"
+        Write-Log "[CAUSA]: Comportamento atipico. Analise o log detalhado acima."
     }
+
+    if ($internet -and -not $ad) {
+        Write-Log "`n[INFO]: Servidor AD ($ADServer) inacessivel. Ignore se estiver fora da rede corporativa."
+    }
+
+    Write-Log "========================================="
 }
 
 # ================= EXECUCAO =================
@@ -162,11 +213,15 @@ Get-NetworkState
 
 Update-Progress "Testando conectividade estrutural"
 $gwNextHop = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue).NextHop
+
+$gwTest = $false
 if ($gwNextHop) {
-    $gwTest = Test-Ping $gwNextHop
-} else {
-    $gwTest = $false
+    Test-Connection -ComputerName $gwNextHop -Count 1 -Quiet | Out-Null
+    $arpCheck = arp -a | Select-String $gwNextHop
+    $pingCheck = Test-Ping $gwNextHop
+    if ($arpCheck -or $pingCheck) { $gwTest = $true }
 }
+
 $adTest = Test-Ping $ADServer
 $internetTest = Test-Ping $InternetIP
 
@@ -174,12 +229,13 @@ $dnsTest = Test-DNS
 Test-Ports
 Test-Jitter
 Test-MTU
-Get-Classification $gwTest $adTest $dnsTest
+
+Get-Classification $gwTest $internetTest $dnsTest $adTest
 
 Write-Progress -Activity "Diagnostico N2 em execucao..." -Completed
 
 Write-Log "`nDiagnostico concluido."
-Write-Log "Log salvo com sucesso em: $LogFile"
+Write-Log "Log salvo em: $LogFile"
 
 Write-Host "`nPressione ENTER para sair..."
 Read-Host
