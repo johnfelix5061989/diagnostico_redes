@@ -1,5 +1,5 @@
 # ================================
-# DIAGNOSTICO N2 - REDE (v5 - Fail-Safe)
+# DIAGNOSTICO N2 - REDE LEGADA (v6)
 # ================================
 
 Clear-Host
@@ -22,8 +22,8 @@ function Write-Log {
 }
 
 Write-Log "========================================="
-Write-Log " DIAGNOSTICO N2 - ANALISE DE REDE "
-Write-Log " Data: $(Get-Date)"
+Write-Log " DIAGNOSTICO N2 - INFRAESTRUTURA LEGADA"
+Write-Log " Host: $Hostname | Data: $(Get-Date)"
 Write-Log "========================================="
 
 # -------- VARIAVEIS --------
@@ -32,7 +32,7 @@ $InternetIP = "8.8.8.8"
 $TestDomain = "google.com"
 $PortsToTest = @(53,443,389,445)
 
-$TotalSteps = 7
+$TotalSteps = 8
 $CurrentStep = 0
 
 function Update-Progress($StepName) {
@@ -43,34 +43,73 @@ function Update-Progress($StepName) {
                    -PercentComplete $percent
 }
 
-# -------- 1 - ESTADO DA INTERFACE --------
+# -------- 1 - ESTADO DA INTERFACE E FISICO --------
 function Get-NetworkState {
-    Update-Progress "Analisando interface de rede"
+    Update-Progress "Analisando hardware e interfaces"
 
-    $ipconfig = Get-NetIPConfiguration | Where-Object {
-        $_.IPv4Address -ne $null -and 
-        $_.InterfaceAlias -notmatch "Bluetooth|Virtual|VMware|Hyper-V|Loopback"
+    # Pega placas fisicas reais, ignorando virtuais e bluetooth
+    $adapters = Get-NetAdapter | Where-Object {
+        $_.Status -eq 'Up' -and 
+        $_.InterfaceDescription -notmatch "Bluetooth|Virtual|VMware|Hyper-V|Loopback"
     }
 
-    foreach ($i in $ipconfig) {
-        Write-Log "`nInterface: $($i.InterfaceAlias)"
-        Write-Log "IP: $($i.IPv4Address.IPAddress)"
-        Write-Log "Gateway: $($i.IPv4DefaultGateway.NextHop)"
-        Write-Log "DNS: $($i.DNSServer.ServerAddresses -join ', ')"
+    if (-not $adapters) {
+        Write-Log "`n[!] NENHUM CABO OU REDE CONECTADA."
+        return
+    }
 
-        # Verifica qual placa pegou APIPA ou qual esta saudavel
-        if ($i.IPv4Address.IPAddress -like "169.254.*") {
-            Write-Log "[!] APIPA detectado em: $($i.InterfaceAlias)"
-            if ($i.InterfaceAlias -match "Wi-Fi|Wireless") {
-                $global:WifiApipa = $true
-            } else {
-                $global:ApipaGeral = $true
-            }
-        } else {
-            if ($i.InterfaceAlias -match "Ethernet|Conexao Local") {
-                $global:EthernetAtiva = $true
+    foreach ($adapter in $adapters) {
+        Write-Log "`n--- Adaptador: $($adapter.InterfaceAlias) ---"
+        Write-Log "Descricao: $($adapter.InterfaceDescription)"
+        Write-Log "MAC Address: $($adapter.MacAddress)  <-- (Use para rastrear no Switch)"
+        Write-Log "Velocidade Negociada: $($adapter.LinkSpeed)"
+
+        # ALERTA DE CABEAMENTO LEGADO
+        if ($adapter.LinkSpeed -match "10 Mbps|100 Mbps" -and $adapter.InterfaceAlias -match "Ethernet|Conexao Local") {
+            Write-Log "[!] ATENCAO FISICA: Placa operando a 100Mbps ou menos. Se o switch for Gigabit, ha degradacao no patch cord, tomada ou porta do rack."
+        }
+
+        # Perfil de Firewall (Dominio vs Publico)
+        $profile = Get-NetConnectionProfile -InterfaceAlias $adapter.InterfaceAlias -ErrorAction SilentlyContinue
+        if ($profile) {
+            Write-Log "Perfil de Firewall: $($profile.NetworkCategory)"
+            if ($profile.NetworkCategory -eq "Public") {
+                Write-Log "[!] ALERTA SO: Rede classificada como PUBLICA. O Windows pode bloquear pastas de rede e AD."
             }
         }
+
+        # Informacoes de IP
+        $ipconfig = Get-NetIPConfiguration -InterfaceAlias $adapter.InterfaceAlias -ErrorAction SilentlyContinue
+        if ($ipconfig.IPv4Address) {
+            Write-Log "IP: $($ipconfig.IPv4Address.IPAddress)"
+            Write-Log "Gateway: $($ipconfig.IPv4DefaultGateway.NextHop)"
+            Write-Log "DNS: $($ipconfig.DNSServer.ServerAddresses -join ', ')"
+
+            # Controle APIPA e Fail-Safe
+            if ($ipconfig.IPv4Address.IPAddress -like "169.254.*") {
+                Write-Log "[!] APIPA detectado em: $($adapter.InterfaceAlias)"
+                if ($adapter.InterfaceAlias -match "Wi-Fi|Wireless") {
+                    $global:WifiApipa = $true
+                } else {
+                    $global:ApipaGeral = $true
+                }
+            } else {
+                if ($adapter.InterfaceAlias -match "Ethernet|Conexao Local") {
+                    $global:EthernetAtiva = $true
+                }
+            }
+        } else {
+            Write-Log "[!] Sem configuracao de IPv4."
+        }
+    }
+
+    # VERIFICACAO DE PROXY (O vilao invisivel)
+    $proxy = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+    if ($proxy.ProxyEnable -eq 1) {
+        Write-Log "`n[!] ALERTA PROXY: Proxy manual ativado no Windows: $($proxy.ProxyServer)"
+    }
+    if ($proxy.AutoConfigURL) {
+        Write-Log "`n[!] ALERTA PROXY: Script PAC configurado: $($proxy.AutoConfigURL)"
     }
 }
 
@@ -127,10 +166,8 @@ function Test-Jitter {
         Write-Log "Jitter: $jitter ms"
 
         if ($jitter -gt 50) {
-            Write-Log "[!] Jitter elevado"
+            Write-Log "[!] Jitter elevado (Comum em cabos degradados ou switch saturado)"
         }
-    } else {
-        Write-Log "Falha ao calcular Jitter. Sem resposta de ping externo."
     }
 }
 
@@ -159,49 +196,40 @@ function Get-Classification($gw, $internet, $dns, $ad) {
     Update-Progress "Gerando laudo final"
 
     Write-Log "`n========================================="
-    Write-Log " STATUS FINAL DA MAQUINA"
+    Write-Log " LAUDO TECNICO DE CONECTIVIDADE"
     Write-Log "========================================="
 
-    # FAIL-SAFE: Cabeada, com internet, mas o Wi-Fi esta abandonado com APIPA
     if ($global:EthernetAtiva -and ($internet -or $dns) -and $global:WifiApipa) {
-        Write-Log "[ESTADO]: ONLINE / CABEADO E TOTALMENTE FUNCIONAL"
-        Write-Log "[FAIL-SAFE ATIVADO]: O adaptador Wi-Fi gerou um IP fantasma (APIPA), porem a maquina esta navegando pela rede Ethernet. Falso positivo ignorado."
+        Write-Log "[ESTADO]: ONLINE / CABEADO FUNCIONAL"
+        Write-Log "[FAIL-SAFE ATIVADO]: Wi-Fi abandonado com IP APIPA ignorado. Navegacao fluindo pela porta Ethernet."
     }
-    # Regra de Ouro geral: Internet ou DNS funcionando
     elseif ($internet -or $dns) {
         Write-Log "[ESTADO]: CONECTADO E OPERACIONAL"
         Write-Log "[CAMADA]: L1 a L7 Operacionais"
-        Write-Log "[CAUSA]: O trafego de rede esta fluindo normalmente."
-        
-        if ($global:ApipaGeral) {
-            Write-Log "`n[ALERTA SECUNDARIO]: Outro adaptador da maquina falhou no DHCP, mas nao afetou a navegacao."
-        }
+        Write-Log "[CAUSA]: Roteamento principal funcional. Se o usuario reclama de lentidao, analise a Velocidade Negociada (Link Speed) e o Jitter no log acima."
     }
-    # Falha real e critica de cabo/switch
     elseif ($global:ApipaGeral) {
-        Write-Log "[ESTADO]: OFFLINE / SEM REDE"
+        Write-Log "[ESTADO]: OFFLINE / SEM COMUNICACAO L2"
         Write-Log "[CAMADA]: Camadas 1 e 2 (Fisica / Enlace)"
-        Write-Log "[CAUSA]: Falha de DHCP na interface principal. Verifique cabo, porta do switch ou VLAN."
+        Write-Log "[CAUSA]: Falha de DHCP. Encaminhe o MAC Address acima para o N3 rastrear a porta no Switch/VLAN. Verifique cabeamento."
     }
-    # Sem gateway e sem internet
     elseif (-not $gw) {
-        Write-Log "[ESTADO]: COMUNICACAO LOCAL FALHA"
-        Write-Log "[CAMADA]: Camadas 1, 2 ou 3 (Fisica / Enlace / Rede)"
-        Write-Log "[CAUSA]: Gateway local inacessivel e maquina sem internet."
+        Write-Log "[ESTADO]: ISOLAMENTO LOCAL"
+        Write-Log "[CAMADA]: Camadas 1, 2 ou 3"
+        Write-Log "[CAUSA]: Falha de comunicacao com o Gateway. Porta bloqueada no switch, IP duplicado ou cabeamento severamente danificado."
     }
-    # Com gateway, mas sem internet
     elseif ($gw -and (-not $internet -or -not $dns)) {
-        Write-Log "[ESTADO]: SEM ACESSO EXTERNO OU RESOLUCAO"
-        Write-Log "[CAMADA]: Camada 3 (Roteamento) ou Camada 7 (Aplicacao)"
-        Write-Log "[CAUSA]: O pacote chega ao Switch/Gateway, mas roteamento externo ou DNS estao falhando."
+        Write-Log "[ESTADO]: BLOQUEIO DE ROTA EXTERNA OU DNS"
+        Write-Log "[CAMADA]: Camada 3 (Roteamento) ou Camada 7 (Aplicacao/Proxy)"
+        Write-Log "[CAUSA]: Chega no rack local, mas nao sai para web. Verifique Proxy no Windows (log acima), link MikroTik ou regras de Firewall."
     }
     else {
         Write-Log "[ESTADO]: INDETERMINADO"
-        Write-Log "[CAUSA]: Comportamento atipico. Analise o log detalhado acima."
+        Write-Log "[CAUSA]: Analise o log detalhado."
     }
 
     if ($internet -and -not $ad) {
-        Write-Log "`n[INFO]: Servidor AD ($ADServer) inacessivel. Ignore se estiver fora da rede corporativa."
+        Write-Log "`n[INFO]: O Controlador de Dominio ($ADServer) nao respondeu. Verifique roteamento interno/VLANs."
     }
 
     Write-Log "========================================="
@@ -235,7 +263,7 @@ Get-Classification $gwTest $internetTest $dnsTest $adTest
 Write-Progress -Activity "Diagnostico N2 em execucao..." -Completed
 
 Write-Log "`nDiagnostico concluido."
-Write-Log "Log salvo em: $LogFile"
+Write-Log "Log salvo com sucesso em: $LogFile"
 
-Write-Host "`nPressione ENTER para sair..."
+Write-Host "`nPressione ENTER para fechar..."
 Read-Host
